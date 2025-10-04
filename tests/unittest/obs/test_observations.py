@@ -192,6 +192,19 @@ class TestOpportunityProperties:
         assert ob.target_properties[0]["name"] == "r_LP_P_normd"
         assert ob.target_properties[1]["norm"] == 1.0
 
+    def test_init_new_api(self):
+        ob = obs.OpportunityProperties(
+            obs.TargetOpportunityProperty(prop="r_LP_P", norm=2.0),
+            obs.TargetOpportunityProperty(prop="r_LP_P", norm=2.0),
+            obs.TargetOpportunityProperty(
+                prop="double_priority", fn=lambda sat, opp: opp["target"].priority * 2.0
+            ),
+            n_ahead_observe=2,
+        )
+        assert ob.target_properties[0].fn
+        assert ob.target_properties[0].name == "r_LP_P_normd"
+        assert ob.target_properties[1].norm == 1.0
+
     def test_get_obs(self):
         ob = obs.OpportunityProperties(
             dict(prop="priority", norm=2.0),

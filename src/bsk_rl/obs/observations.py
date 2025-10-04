@@ -3,13 +3,15 @@
 import logging
 from abc import ABC, abstractmethod
 from copy import deepcopy
-from typing import TYPE_CHECKING, Any, Union
+from typing import TYPE_CHECKING, Any, Union, Callable
 
 import numpy as np
 from gymnasium import spaces
 
 from bsk_rl.utils.functional import Resetable, vectorize_nested_dict
 from bsk_rl.utils.orbital import rv2HN
+
+from enum import Enum
 
 if TYPE_CHECKING:  # pragma: no cover
     from bsk_rl.sats import Satellite
@@ -253,7 +255,8 @@ class SatProperties(Observation):
                         obs_property["module"] = module
                         break
                 else:
-                    raise AttributeError(f"Property {obs_property['prop']} not found")
+                    raise AttributeError(
+                        f"Property {obs_property['prop']} not found")
 
     def get_obs(self) -> dict[str, Any]:
         """Return the observation.
@@ -324,7 +327,8 @@ def _target_angle_rate(sat, opp):
     omega_BP_P = sat.dynamics.omega_BP_P
     omega_CP_ref = (
         omega_BP_P
-        - np.cross(v_BN_P, r_LP_P - r_BN_P) / np.linalg.norm(r_LP_P - r_BN_P) ** 2
+        - np.cross(v_BN_P, r_LP_P - r_BN_P) /
+        np.linalg.norm(r_LP_P - r_BN_P) ** 2
     )
     return np.linalg.norm(omega_CP_ref)
 
@@ -337,60 +341,133 @@ def _r_LB_H(sat, opp):
     return HN @ r_TB_N
 
 
-class OpportunityProperties(Observation):
-    _fn_map = {
-        "priority": lambda sat, opp: opp["object"].priority,
-        "r_LP_P": lambda sat, opp: opp["r_LP_P"],
-        "r_LB_H": _r_LB_H,
-        "opportunity_open": lambda sat, opp: opp["window"][0] - sat.simulator.sim_time,
-        "opportunity_mid": lambda sat, opp: sum(opp["window"]) / 2
-        - sat.simulator.sim_time,
-        "opportunity_close": lambda sat, opp: opp["window"][1] - sat.simulator.sim_time,
-        "target_angle": _target_angle,
-        "target_angle_rate": _target_angle_rate,
-    }
+class TargetOpportunityProperty():
+    class Property(Enum):
+        """Enumeration of opportunity properties used in observations.
+
+        Each member stores a function that computes the property value
+        given a satellite (`sat`) and an opportunity (`opp`).
+
+        Members:
+            priority: Priority of the target.
+            r_LP_P: Location of the target in the planet-fixed frame.
+            r_LB_H: Location of the target in the Hill frame.
+            opportunity_open: Time until the opportunity opens.
+            opportunity_mid: Time until the opportunity midpoint.
+            opportunity_close: Time until the opportunity closes.
+            target_angle: Angle between the target and the satellite instrument direction.
+            target_angle_rate: Rate difference between the target pointing frame and the body frame.
+        """
+        priority = lambda sat, opp: opp["object"].priority
+        r_LP_P = lambda sat, opp: opp["r_LP_P"]
+        r_LB_H = _r_LB_H
+        opportunity_open = lambda sat, opp: opp["window"][0] - sat.simulator.sim_time
+        opportunity_mid = lambda sat, opp: sum(opp["window"]) / 2 - sat.simulator.sim_time
+        opportunity_close = lambda sat, opp: opp["window"][1] - sat.simulator.sim_time
+        target_angle = _target_angle
+        target_angle_rate = _target_angle_rate
+
+        @classmethod
+        def from_key(cls, key: str) -> "TargetOpportunityProperty.Property":
+            try:
+                return cls[key]
+            except KeyError as e:
+                raise KeyError(f"Unknown Property key: {key!r}") from e
+
 
     def __init__(
         self,
-        *target_properties: dict[str, Any],
+        name: str = None,
+        fn: Callable[[Any, Any], Any] = None,
+        prop: Union[Property, str] = None,
+        norm: float = 1.0,
+        i: int = 0,
+    ):
+        """Property derived from an access opportunity to append to the observation.
+
+        Property that is a function of the opportunity to be appended to the the
+        observation. Properties are optionally normalized by some factor.
+
+        Args:
+            name: Explicit name for this observation element.
+            fn: Callable to compute the value, with signature fn(satellite, opportunity) -> Any``.
+            prop: If fn is not provided, this key will be used to look up a preset function:
+            norm: Scalar used to normalize the computed value. Defaults to ``1.0``.
+            i: Index used only for auto-naming when neither name nor prop is provided.
+        """
+        if isinstance(prop, str):
+            prop = self.Property.from_key(prop) # from_key method handles errors
+
+        # Choose fn
+        if fn is None:
+            if prop is None:
+                raise ValueError("Either `fn` or `prop` must be provided.")
+            fn = prop.value
+        else:
+            if prop is not None:
+                logger.warning(
+                    f"Ignoring default function for `{prop}` when `fn` is provided."
+                )
+
+        # Determine best name
+        if name is None:
+            if isinstance(prop, TargetOpportunityProperty.Property):
+                name = prop.name
+            else:
+                name = f"prop_{i}"
+            if norm != 1.0:
+                name += "_normd"
+
+        self.name = name
+        self.fn = fn
+        self.norm = norm
+
+    @classmethod
+    def from_dict(cls, spec: dict[str, Any], i: int = 0) -> "TargetOpportunityProperty":
+        """Initialize from a legacy dict spec with keys {prop, fn, name, norm}."""
+        for key in spec:
+            if key not in ["fn", "norm", "name", "prop"]:
+                raise ValueError(f"Invalid property key: {key}")
+
+        name = spec.get("name")
+        fn = spec.get("fn")
+        prop = spec.get("prop")
+        norm = spec.get("norm", 1.0)
+
+        return cls(name=name, fn=fn, prop=prop, norm=norm, i=i)
+
+    def __getitem__(self, key):
+        return getattr(self, key)
+
+    def __setitem__(self, key, value):
+        setattr(self, key, value)
+_ = list(TargetOpportunityProperty.Property) # loader
+
+class OpportunityProperties(Observation):
+    def __init__(
+        self,
+        *target_properties: dict[str, Any] | TargetOpportunityProperty,
         n_ahead_observe: int,
         type="target",
         name=None,
     ):
-        """Include information about upcoming access opportunities in the observation..
+        """Include information about upcoming access opportunities in the observation.
 
-        For each desired property, a dictionary specifying the property name and settings
+        For each desired property, a TargetOpportunityProperty object specifying the property name and settings
         is passed. These can include preset properties or arbitrary functions of the satellite
         and opportunity.
 
         .. code-block:: python
 
             OpportunityProperties(
-                dict(prop="r_LP_P", norm=REQ_EARTH * 1e3),
-                dict(prop="double_priority", fn=lambda sat, opp: opp["target"].priority * 2.0),
+                TargetOpportunityProperty(prop="r_LP_P", norm=REQ_EARTH * 1e3),
+                TargetOpportunityProperty(name="double_priority",
+                                          fn=lambda sat, opp: opp["object"].priority * 2.0),
                 n_ahead_observe=16,
             )
 
         Args:
-            target_properties: Property that is a function of the opportunity to be appended
-                to the the observation. Properties are optionally normalized by some factor.
-                Each observation is a dictionary with the keys:
-
-                * ``name`` `optional`: Name of the observation element.
-                * ``fn`` `optional`: Function to calculate property, in the form ``fn(satellite, opportunity)``.
-                  If not provided, the key ``prop`` will be used to look up a preset function:
-
-                    * ``priority``: Priority of the target.
-                    * ``r_LP_P``: Location of the target in the planet-fixed frame.
-                    * ``r_LB_H``: Location of the target in the Hill frame.
-                    * ``opportunity_open``: Time until the opportunity opens.
-                    * ``opportunity_mid``: Time until the opportunity midpoint.
-                    * ``opportunity_close``: Time until the opportunity closes.
-                    * ``target_angle``: Angle between the target and the satellite instrument direction.
-                    * ``target_angle_rate``: Rate difference between the target pointing frame and the body frame.
-
-                * ``norm`` `optional`: Value to normalize property by. Defaults to 1.0.
-
+            target_properties: Property that is a function of the opportunity to be appended to the the observation.
             n_ahead_observe: Number of upcoming targets to consider.
             type: The type of opportunity to consider. Can be ``target``, ``ground_station``,
                 or any other type of opportunity that has been added via
@@ -401,38 +478,19 @@ class OpportunityProperties(Observation):
             name = type
         super().__init__(name=name)
         self.type = type
-        self.target_properties = target_properties
-        for i, prop_spec in enumerate(self.target_properties):
-            for key in prop_spec:
-                if key not in ["fn", "norm", "name", "prop"]:
-                    raise ValueError(f"Invalid property key: {key}")
 
-            if "norm" not in prop_spec:
-                prop_spec["norm"] = 1.0
-
-            # Determine observation function
-            if "fn" not in prop_spec:
-                try:
-                    prop_spec["fn"] = self._fn_map[prop_spec["prop"]]
-                except KeyError:
-                    raise ValueError(
-                        f"Property prop={prop_spec['prop']} is not predefined and no `fn` was provided."
-                    )
+        normalized = []
+        for i, prop in enumerate(target_properties):
+            if isinstance(prop, TargetOpportunityProperty):
+                normalized.append(prop)
+            elif isinstance(prop, dict):
+                normalized.append(TargetOpportunityProperty.from_dict(prop, i=i))
             else:
-                if "prop" in prop_spec and prop_spec["prop"] in self._fn_map:
-                    logger.warning(
-                        f"Ignoring default function for `{prop_spec['prop']}` when `fn` is provided."
-                    )
-
-            # Determine best name
-            if "name" not in prop_spec:
-                if "prop" in prop_spec:
-                    prop_spec["name"] = prop_spec["prop"]
-                else:
-                    prop_spec["name"] = f"prop_{i}"
-
-                if prop_spec["norm"] != 1.0:
-                    prop_spec["name"] += "_normd"
+                raise TypeError(
+                    "Each target property must be a dict or a TargetOpportunityProperty"
+                    f"got {type(prop).__name__}."
+                )
+        self.target_properties = normalized
 
         self.n_ahead_observe = int(n_ahead_observe)
 
@@ -457,10 +515,10 @@ class OpportunityProperties(Observation):
             )
         ):
             props = {}
-            for prop_spec in self.target_properties:
-                name = prop_spec["name"]
-                norm = prop_spec["norm"]
-                value = prop_spec["fn"](self.satellite, opportunity)
+            for prop in self.target_properties:
+                name = prop.name
+                norm = prop.norm
+                value = prop.fn(self.satellite, opportunity)
                 props[name] = value / norm
             obs[f"{self.name}_{i}"] = props
         return obs
