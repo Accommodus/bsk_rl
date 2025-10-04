@@ -39,6 +39,7 @@ from bsk_rl.obs.observations import (
     Eclipse,
     Observation,
     OpportunityProperties,
+    TargetOpportunityProperty,
     ResourceRewardWeight,
     SatProperties,
     Time,
